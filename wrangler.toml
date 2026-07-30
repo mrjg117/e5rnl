@@ -9,8 +9,8 @@ crons = ["*/30 * * * *"]
 [vars]
 # ── 调度控制 ──
 RUN_PROBABILITY = "0.5"
-# SELF_TEST = "0"
-# WORKER_URL = "https://your-worker.your-sub.workers.dev"
+SELF_TEST = "1"
+WORKER_URL = "https://your-worker.your-sub.workers.dev"
 
 # ── timing ──
 ACTION_DELAY_MIN_MS = "0"
