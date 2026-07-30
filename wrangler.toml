@@ -6,6 +6,17 @@ compatibility_date = "2024-09-23"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Queue 分批：生产者绑定
+[[queues.producers]]
+queue = "e5rnl"
+binding = "E5RNL_QUEUE"
+
+# Queue 分批：消费者配置
+[[queues.consumers]]
+queue = "e5rnl"
+max_batch_size = 1      # 每次只取 1 条，保证串行
+max_batch_timeout = 0
+
 [vars]
 # ── 调度控制 ──
 RUN_PROBABILITY = "0.5"
