@@ -5,7 +5,7 @@ keep_vars = true
 
 # 固定周期触发。每轮是否真正执行，由 RUN_PROBABILITY 决定。
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/10 * * * *"]
 
 # Queue 分批：生产者绑定
 [[queues.producers]]
@@ -25,7 +25,7 @@ SELF_TEST = "1"
 
 # ── timing ──
 ACTION_DELAY_MIN_MS = "0"
-ACTION_DELAY_MAX_MS = "300"
+ACTION_DELAY_MAX_MS = "1500"
 START_DELAY_MAX_SEC = "0"
 
 # ── 性能 ──
