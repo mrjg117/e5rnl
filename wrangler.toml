@@ -35,11 +35,11 @@ MAX_RUNTIME_MS = "28000"
 
 # ── Azure / Microsoft（全部明文变量，不用 secret）──
 # 鉴权二选一：MS_APP_SECRET（客户端密码）或 MS_CERT_PEM + MS_CERT_PKEY（证书，指纹自动算）
-MS_TENANT_ID = "your-tenant-id"
-MS_APP_ID = "your-app-id"
-USER_ACCOUNT = "user@your-domain.onmicrosoft.com"
+# MS_TENANT_ID = "your-tenant-id"
+# MS_APP_ID = "your-app-id"
+# USER_ACCOUNT = "user@your-domain.onmicrosoft.com"
 # MS_APP_SECRET = "your-client-secret"        # 客户端密码（与证书二选一，用证书则注释掉）
-MS_CERT_PEM = "your-cert-pem"                 # X.509 证书 PEM 全文（指纹自动算）
-MS_CERT_PKEY = "your-private-key-pem"         # 私钥 PEM 全文（PKCS#8）
-SHAREPOINT_SITE_ID = ""                       # 留空自动探测
-SHAREPOINT_LIST_ID = ""                       # 留空自动探测
+# MS_CERT_PEM = "your-cert-pem"                 # X.509 证书 PEM 全文（指纹自动算）
+# MS_CERT_PKEY = "your-private-key-pem"         # 私钥 PEM 全文（PKCS#8）
+# SHAREPOINT_SITE_ID = ""                       # 留空自动探测
+# SHAREPOINT_LIST_ID = ""                       # 留空自动探测
