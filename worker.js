@@ -2,8 +2,8 @@
  * E5 订阅续期（Cloudflare Worker，单文件版本 2.6.2）
  *
  * ── 部署方式 ──
- * 把本文件【整段】直接粘贴到 Cloudflare 仪表盘 Workers » 你的 Worker » Quick Edit 即可。
- * 不依赖任何外部文件 / npm 包 / wrangler，纯 V8 运行时原生可跑。
+ * 需绑定 Cloudflare Queue（E5RNL_QUEUE）；推荐用 wrangler deploy。
+ * 不依赖任何外部文件 / npm 包，纯 V8 运行时原生可跑。
  *
  * ── 逻辑总览 ──
  * 一个纯定时任务（Cron），给微软 E5 开发者订阅「续命」：用 app-only（client_credentials，
@@ -11,13 +11,11 @@
  * 联系人 / To Do / Teams / SharePoint 等多工作负载上做「建→改→读→删」+ 只读探测，制造真实
  * 活跃足迹，规避微软活跃度评估被回收。
  *
- *   - 仅暴露一个受保护的内部端点 /__diag（用于自测分批链式调用），鉴权不通过即 403。
  *   - 每个 tick 按 RUN_PROBABILITY 概率「整轮跳过」制造大时间波动；命中后跑满全部 API 面。
  *   - 阶段1：9 可写（必做建+改+读+删，内联 DELETE 本轮自清）+ 23 只读探测，并发批次、各跑各的。
  *   - 阶段2：8 个清扫兜底动作 list 各位置删掉所有 <MARK>_ 残留（含上轮超时孤儿）。
  *   - 预算帽 MAX_API_CALLS（默认 48）+ 墙钟 MAX_RUNTIME_MS（默认 25000）保证「能跑多少跑多少」绝不报错。
- *   - 设置 SELF_TEST="1" 变量后，cron tick 自动启动全量分批自测，链式调用跑完全部 API 面。
- *   - 自测分批需设置 WORKER_URL 变量（Worker 自身 URL），用于链式自调用。
+ *   - 全量分批：通过 Cloudflare Queue（E5RNL_QUEUE）实现，按预算贪心装批，状态跟着消息走。
  *   - 所有可观测性走 Worker 日志（console），用仪表盘 Workers Logs 查看。
  *
  * ── 创建资源的统一标记 ──
@@ -33,22 +31,6 @@ let tokenCache = { token: null, expiry: 0 };
 // 运行时 subrequest 预算（仅 runRenewal 设置/清零）；authedFetch 超出即抛 BUDGET 错误，
 // 保证单轮不超免费版 50 subrequest 硬上限（令牌另占 1，故默认上限 48）。runDiagnostics 不计数。
 let budget = null;
-
-// ── 自测分批状态（模块级；自调用链期间 isolate 保持活跃）──
-let diagState = null; // { results, index, total, running }
-
-/**
- * 生成动态自测鉴权 token：SHA-256(APP_ID:YYYYMMDD)，每日轮换。
- * Worker 自调用时自行计算，外部不知道 APP_ID 则无法伪造。
- */
-async function getDiagToken(appId, dayOffset = 0) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + dayOffset);
-  const ds = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-  const raw = `${appId}:${ds}`;
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
-  return b64url(new Uint8Array(buf));
-}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -669,73 +651,86 @@ export async function runRenewal(cfg, log = console) {
   return results;
 }
 
-/**
- * 全量 API 通断自测（分批版）：每次执行 DIAG_BATCH_SIZE 个 action，
- * 返回 { done, summary }。done=false 表示还有剩余，由 fetch handler 链式自调用续跑。
- * 首次调用（diagState=null）初始化并打乱顺序；后续调用从断点继续。
- */
-const DIAG_BATCH_SIZE = 8; // 每批 8 个 action ≈ 24~40 次 fetch，安全在 50 subrequest 内
+// ===================================================================
+// Queue 分批：按预算贪心装批，状态跟着消息走，无需 KV
+// ===================================================================
 
-async function runDiagnosticsBatch(cfg, log = console) {
-  if (!diagState || !diagState.running) {
-    spCache = undefined;
-    diagState = {
-      results: [],
-      index: 0,
-      total: WRITABLE.length + READONLY.length,
-      all: shuffle([...WRITABLE, ...READONLY]),
-      running: true,
-    };
+// 每个 action 的最坏情况 API 调用估算（含 404 重试路径）
+const COST_TABLE = {
+  onedrive: 6, onedrive_folder: 4, outlook: 4,
+  calendar_event: 4, calendar_calendar: 3, contacts: 4,
+  todo_task: 5, todo_list: 3, sharepoint: 5,
+  // 只读 probe（取 2 留余量，多数实际只 1 次）
+  teams: 2, teams_channels: 2, mailbox: 1,
+  drive_root: 1, drive_list: 1, drive_root_dir: 1,
+  mail_folders: 1, mail_inbox: 1, messages: 1,
+  mail_categories: 1, calendar_view: 1, calendars: 1,
+  events: 1, profile: 1, manager: 1, direct_reports: 1,
+  memberof: 1, people: 1, groups_all: 1,
+  sharepoint_sites: 1, sharepoint_site_lists: 1,
+  contacts_folders: 1, todo_lists_read: 1,
+  // sweep（list + 可能多个 delete）
+  sweep_onedrive: 5, sweep_outlook: 5, sweep_calendar_event: 5,
+  sweep_calendar_cal: 5, sweep_contacts: 5, sweep_todo_task: 8,
+  sweep_todo_list: 5, sweep_sharepoint: 5,
+};
+
+/**
+ * 贪心装批：从 remaining 里按顺序装 action，直到预算不够。
+ * 返回 { batch: action对象数组, consumed: 本批消耗估算, nextRemaining: 剩余 action name 列表 }
+ */
+function packBatch(remaining, maxBudget = 45) {
+  let budget = maxBudget;
+  const batch = [];
+  let cutAt = 0;
+  for (const name of remaining) {
+    const cost = COST_TABLE[name] || 2;
+    if (budget - cost < 0) break;
+    const action = [...WRITABLE, ...READONLY, ...SWEEPS].find((a) => a.name === name);
+    if (action) {
+      batch.push(action);
+      budget -= cost;
+    }
+    cutAt++;
   }
-  budget = { max: 45, used: 0 }; // 自测也受预算保护，防止超 50 硬限
-  const token = await getToken(cfg);
-  const end = Math.min(diagState.index + DIAG_BATCH_SIZE, diagState.total);
-  for (let i = diagState.index; i < end; i++) {
-    const a = diagState.all[i];
+  return { batch, consumed: 45 - budget, nextRemaining: remaining.slice(cutAt) };
+}
+
+/**
+ * 执行一批 action，返回结果数组。
+ */
+async function executeBatch(batch, cfg, token, log) {
+  const results = [];
+  for (const a of batch) {
     try {
       const msg = await a.fn(cfg, token);
       if (msg === null) {
-        diagState.results.push({ name: a.name, ok: false, skipped: true });
-        if (log.info) log.info(`SELFTEST SKIP [${a.name}] 前置条件不满足`);
+        results.push({ name: a.name, ok: false, skipped: true });
+        if (log.info) log.info(`BATCH SKIP [${a.name}] 前置条件不满足`);
       } else {
-        diagState.results.push({ name: a.name, ok: true, msg });
-        if (log.info) log.info(`SELFTEST OK   [${a.name}] ${msg}`);
+        results.push({ name: a.name, ok: true, msg });
+        if (log.info) log.info(`BATCH OK   [${a.name}] ${msg}`);
       }
     } catch (e) {
       if (e && e.code === 'BUDGET') {
-        diagState.results.push({ name: a.name, ok: false, skipped: true, error: 'budget' });
-        if (log.warn) log.warn(`SELFTEST SKIP [${a.name}] 已达 subrequest 上限`);
-        diagState.index = i + 1;
-        budget = null;
-        return { done: false, summary: { ts: Date.now(), total: diagState.total, ok: 0, fail: 0, skip: 0, done: false, batchEnd: diagState.index, budgetExceeded: true } };
+        results.push({ name: a.name, ok: false, skipped: true, error: 'budget' });
+        if (log.warn) log.warn(`BATCH SKIP [${a.name}] 已达 subrequest 上限`);
+        break; // 预算耗尽，本批剩余也不跑了
       }
       if (a.allow404 && e && /-> 404:/.test(e.message)) {
-        diagState.results.push({ name: a.name, ok: true, msg: '无数据(404)' });
-        if (log.info) log.info(`SELFTEST OK   [${a.name}] 无数据(404)`);
+        results.push({ name: a.name, ok: true, msg: '无数据(404)' });
+        if (log.info) log.info(`BATCH OK   [${a.name}] 无数据(404)`);
       } else {
-        diagState.results.push({ name: a.name, ok: false, error: e.message });
-        if (log.warn) log.warn(`SELFTEST FAIL [${a.name}] ${e.message}`);
+        results.push({ name: a.name, ok: false, error: e.message });
+        if (log.warn) log.warn(`BATCH FAIL [${a.name}] ${e.message}`);
       }
     }
   }
-  budget = null;
-  diagState.index = end;
-  const done = diagState.index >= diagState.total;
-  const ok = diagState.results.filter((r) => r.ok).length;
-  const fail = diagState.results.filter((r) => !r.ok && !r.skipped).length;
-  const skip = diagState.results.filter((r) => r.skipped).length;
-  const summary = { ts: Date.now(), total: diagState.total, ok, fail, skip, done, batchEnd: end };
-  if (done) {
-    diagState.running = false;
-    if (log.info) log.info(`SELFTEST 完成：${ok}/${diagState.total} 通过, ${fail} 失败, ${skip} 跳过`);
-  } else {
-    if (log.info) log.info(`SELFTEST 批次完成 ${end}/${diagState.total}，等待下一批...`);
-  }
-  return { done, summary };
+  return results;
 }
 
 // ===================================================================
-// Worker 入口（scheduled 定时续期 + fetch 内部自测端点）
+// Worker 入口（scheduled 定时续期 + queue 分批消费）
 // ===================================================================
 
 function cfgFromEnv(env) {
@@ -757,77 +752,97 @@ function cfgFromEnv(env) {
   };
 }
 
+function validateCfg(cfg) {
+  const ALWAYS_REQUIRED = ['MS_TENANT_ID', 'MS_APP_ID', 'USER_ACCOUNT'];
+  const missingAlways = ALWAYS_REQUIRED.filter((k) => !cfg[k]);
+  if (missingAlways.length) {
+    console.error(`[CRITICAL] 缺少必需凭据：${missingAlways.join(', ')}；请到 Cloudflare 变量页设置后再运行`);
+    return false;
+  }
+  const hasCert = !!(cfg.MS_CERT_PEM && cfg.MS_CERT_PKEY);
+  const hasSecret = !!cfg.MS_APP_SECRET;
+  if (!hasCert && !hasSecret) {
+    console.error('[CRITICAL] 缺少鉴权凭据：需设置 MS_CERT_PEM+MS_CERT_PKEY（证书）或 MS_APP_SECRET（客户端密码）');
+    return false;
+  }
+  return true;
+}
+
 export default {
-  // ── HTTP 端点：仅用于自测分批链式调用，鉴权不通过则 403 ──
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (url.pathname !== '/__diag') {
-      return new Response('not found', { status: 404 });
-    }
-    if (request.method !== 'GET' && request.method !== 'POST') {
-      return new Response('method not allowed', { status: 405 });
-    }
-    const got = request.headers.get('x-diag-token') || '';
-    const todayToken = await getDiagToken(env.MS_APP_ID);
-    const yestToken = await getDiagToken(env.MS_APP_ID, -1);
-    if (got !== todayToken && got !== yestToken) {
-      return new Response('forbidden', { status: 403 });
-    }
+  // ── Queue consumer：从消息取 remaining + results，贪心装批执行，剩余发下条 ──
+  async queue(batch, env, ctx) {
     const cfg = cfgFromEnv(env);
-    const { done, summary } = await runDiagnosticsBatch(cfg, console);
-    if (!done && env.WORKER_URL) {
-      const nextToken = await getDiagToken(env.MS_APP_ID);
-      ctx.waitUntil(
-        fetch(`${env.WORKER_URL.replace(/\/$/, '')}/__diag`, {
-          headers: { 'x-diag-token': nextToken },
-        }).catch(e => console.error(`[SELFTEST] 链式调用失败: ${e.message}`))
-      );
+    const maxBudget = Number(cfg.MAX_API_CALLS != null && cfg.MAX_API_CALLS !== '' ? cfg.MAX_API_CALLS : 45);
+
+    for (const msg of batch.messages) {
+      try {
+        const { remaining, results, phase } = msg.body;
+        if (!remaining || remaining.length === 0) {
+          msg.ack();
+          continue;
+        }
+
+        spCache = undefined; // 每批重置 SharePoint 缓存
+        budget = { max: maxBudget, used: 0 };
+        const token = await getToken(cfg);
+
+        const { batch: actions, consumed, nextRemaining } = packBatch(remaining, maxBudget);
+        if (actions.length === 0) {
+          console.warn(`[QUEUE] 本批装不下任何 action（remaining[0] 估算过大），跳过`);
+          msg.ack();
+          continue;
+        }
+
+        console.log(`[QUEUE] 本批 ${actions.length} 个 action，估算消耗 ${consumed}/${maxBudget}，剩余 ${nextRemaining.length} 个`);
+        const batchResults = await executeBatch(actions, cfg, token, console);
+        budget = null;
+
+        const allResults = [...(results || []), ...batchResults];
+        const done = nextRemaining.length === 0;
+
+        if (done) {
+          const ok = allResults.filter((r) => r.ok).length;
+          const fail = allResults.filter((r) => !r.ok && !r.skipped).length;
+          const skip = allResults.filter((r) => r.skipped).length;
+          console.log(`[QUEUE] 全量完成：${ok}/${allResults.length} 成功, ${fail} 失败, ${skip} 跳过`);
+          if (fail > 0) console.error(`[CRITICAL] 全量自测存在 ${fail} 个失败项，请检查 scope 授权`);
+        } else {
+          // 发下条消息，带更新后的 remaining + results
+          await env.E5RNL_QUEUE.send({
+            remaining: nextRemaining,
+            results: allResults,
+            phase: phase || 'main',
+          });
+          console.log(`[QUEUE] 已发下批消息，剩余 ${nextRemaining.length} 个 action`);
+        }
+
+        msg.ack();
+      } catch (e) {
+        console.error(`[QUEUE] 消费消息异常：${e.message}`);
+        // 不 ack，让 Queue 自动重试
+      }
     }
-    return new Response(JSON.stringify(summary), {
-      headers: { 'Content-Type': 'application/json' },
-    });
   },
 
   async scheduled(event, env, ctx) {
     const cfg = cfgFromEnv(env);
-    // 硬校验必需凭据：缺失任意一个立即报错返回，绝不静默用占位符/undefined 导致每轮 400 却不易察觉
-    const ALWAYS_REQUIRED = ['MS_TENANT_ID', 'MS_APP_ID', 'USER_ACCOUNT'];
-    const missingAlways = ALWAYS_REQUIRED.filter((k) => !cfg[k]);
-    if (missingAlways.length) {
-      console.error(`[CRITICAL] 缺少必需凭据：${missingAlways.join(', ')}；请到 Cloudflare 变量页设置后再运行`);
-      return;
-    }
-    const hasCert = !!(cfg.MS_CERT_PEM && cfg.MS_CERT_PKEY);
-    const hasSecret = !!cfg.MS_APP_SECRET;
-    if (!hasCert && !hasSecret) {
-      console.error('[CRITICAL] 缺少鉴权凭据：需设置 MS_CERT_PEM+MS_CERT_PKEY（证书）或 MS_APP_SECRET（客户端密码）');
-      return;
-    }
-    // 全量分批自测：由 SELF_TEST 环境变量显式控制（设为 "1" 启用，"0" 或不设则跳过）
-    // 开启后每个 cron tick 都会触发一轮全量自测（首批直接跑，后续批次通过 fetch 自调用链式触发）
-    // 测完确认无误后记得关掉（改为 "0"），避免每 20 分钟重复跑全量
+    if (!validateCfg(cfg)) return;
+
+    // 全量分批：由 SELF_TEST 环境变量控制（"1" 启用）
+    // 开启后每个 cron tick 发一条 Queue 消息，consumer 贪心装批执行，剩余自动续批
     if (env.SELF_TEST === '1') {
       try {
-        diagState = null; // 重置状态，开始新一轮全量自测
-        const { done, summary } = await runDiagnosticsBatch(cfg, console);
-        if (!done && env.WORKER_URL) {
-          const token = await getDiagToken(env.MS_APP_ID);
-          ctx.waitUntil(
-            fetch(`${env.WORKER_URL.replace(/\/$/, '')}/__diag`, {
-              headers: { 'x-diag-token': token },
-            }).catch(e => console.error(`[SELFTEST] 链式调用失败: ${e.message}`))
-          );
-          console.log(`[SELFTEST] 首批完成 ${summary.batchEnd}/${summary.total}，已触发后续批次链式调用`);
-        } else if (done) {
-          console.log(`[SELFTEST] 全量自测完成：${summary.ok}/${summary.total} 通过, ${summary.fail} 失败, ${summary.skip} 跳过`);
-          if (summary.fail > 0) console.error(`[CRITICAL] 全量自测存在失败接口，请检查 scope 授权`);
-        } else if (!env.WORKER_URL) {
-          console.warn('[SELFTEST] 未设置 WORKER_URL，无法链式调用后续批次；请设置 WORKER_URL 以支持分批自测');
-        }
+        const allNames = shuffle([...WRITABLE, ...READONLY]).map((a) => a.name);
+        await env.E5RNL_QUEUE.send({
+          remaining: allNames,
+          results: [],
+          phase: 'main',
+        });
+        console.log(`[SELFTEST] 已发首批消息，共 ${allNames.length} 个 action，Queue 自动分批消费`);
       } catch (e) {
-        console.error(`[CRITICAL] 全量自测异常：${e.message}`);
+        console.error(`[CRITICAL] 全量自测启动失败：${e.message}`);
       }
-      return; // 自测模式不跑正常续期，避免 subrequest 翻倍
+      return;
     }
 
     // 常规续期：按 RUN_PROBABILITY 概率整轮跳过（制造时间波动）
