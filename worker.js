@@ -677,15 +677,17 @@ const COST_TABLE = {
 
 /**
  * 贪心装批：从 remaining 里按顺序装 action，直到预算不够。
+ * 保证至少装入第一个 action（即使估算 cost 超预算），避免消息卡死。
  * 返回 { batch: action对象数组, consumed: 本批消耗估算, nextRemaining: 剩余 action name 列表 }
  */
-function packBatch(remaining, maxBudget = 45) {
+function packBatch(remaining, maxBudget = 48) {
   let budget = maxBudget;
   const batch = [];
   let cutAt = 0;
   for (const name of remaining) {
     const cost = COST_TABLE[name] || 2;
-    if (budget - cost < 0) break;
+    // 已装入至少 1 个且预算不够时停止；首个 action 强制装入
+    if (batch.length > 0 && budget - cost < 0) break;
     const action = [...WRITABLE, ...READONLY, ...SWEEPS].find((a) => a.name === name);
     if (action) {
       batch.push(action);
@@ -693,40 +695,48 @@ function packBatch(remaining, maxBudget = 45) {
     }
     cutAt++;
   }
-  return { batch, consumed: 45 - budget, nextRemaining: remaining.slice(cutAt) };
+  return { batch, consumed: maxBudget - budget, nextRemaining: remaining.slice(cutAt) };
 }
 
 /**
- * 执行一批 action，返回结果数组。
+ * 执行一批 action，返回 { results, unexecuted }。
+ * unexecuted: 因 budget 耗尽而未执行的 action name 列表，调用方应将其追加到 nextRemaining。
  */
 async function executeBatch(batch, cfg, token, log) {
   const results = [];
+  let unexecuted = [];
+  let budgetExhausted = false;
   for (const a of batch) {
+    if (budgetExhausted) {
+      unexecuted.push(a.name);
+      continue;
+    }
     try {
       const msg = await a.fn(cfg, token);
       if (msg === null) {
-        results.push({ name: a.name, ok: false, skipped: true });
+        results.push({ name: a.name, ok: false, skipped: true, readonly: a.readonly });
         if (log.info) log.info(`BATCH SKIP [${a.name}] 前置条件不满足`);
       } else {
-        results.push({ name: a.name, ok: true, msg });
+        results.push({ name: a.name, ok: true, msg, readonly: a.readonly });
         if (log.info) log.info(`BATCH OK   [${a.name}] ${msg}`);
       }
     } catch (e) {
       if (e && e.code === 'BUDGET') {
-        results.push({ name: a.name, ok: false, skipped: true, error: 'budget' });
+        results.push({ name: a.name, ok: false, skipped: true, error: 'budget', readonly: a.readonly });
         if (log.warn) log.warn(`BATCH SKIP [${a.name}] 已达 subrequest 上限`);
-        break; // 预算耗尽，本批剩余也不跑了
+        budgetExhausted = true;
+        continue;
       }
       if (a.allow404 && e && /-> 404:/.test(e.message)) {
-        results.push({ name: a.name, ok: true, msg: '无数据(404)' });
+        results.push({ name: a.name, ok: true, msg: '无数据(404)', readonly: a.readonly });
         if (log.info) log.info(`BATCH OK   [${a.name}] 无数据(404)`);
       } else {
-        results.push({ name: a.name, ok: false, error: e.message });
+        results.push({ name: a.name, ok: false, error: e.message, readonly: a.readonly });
         if (log.warn) log.warn(`BATCH FAIL [${a.name}] ${e.message}`);
       }
     }
   }
-  return results;
+  return { results, unexecuted };
 }
 
 // ===================================================================
@@ -772,7 +782,7 @@ export default {
   // ── Queue consumer：从消息取 remaining + results，贪心装批执行，剩余发下条 ──
   async queue(batch, env, ctx) {
     const cfg = cfgFromEnv(env);
-    const maxBudget = Number(cfg.MAX_API_CALLS != null && cfg.MAX_API_CALLS !== '' ? cfg.MAX_API_CALLS : 45);
+    const maxBudget = Number(cfg.MAX_API_CALLS != null && cfg.MAX_API_CALLS !== '' ? cfg.MAX_API_CALLS : 48);
 
     for (const msg of batch.messages) {
       try {
@@ -788,17 +798,28 @@ export default {
 
         const { batch: actions, consumed, nextRemaining } = packBatch(remaining, maxBudget);
         if (actions.length === 0) {
-          console.warn(`[QUEUE] 本批装不下任何 action（remaining[0] 估算过大），跳过`);
+          console.error(`[CRITICAL] packBatch 返回空批（remaining[0]=${remaining[0]} 估算 cost 超过 budget=${maxBudget}），该 action 被丢弃`);
+          // 丢弃当前无法执行的首个 action，继续处理剩余，避免消息永久卡死
+          const fallbackRemaining = remaining.slice(1);
+          if (fallbackRemaining.length > 0) {
+            await env.E5RNL_QUEUE.send({
+              remaining: fallbackRemaining,
+              results: [...(results || []), { name: remaining[0], ok: false, error: 'cost exceeds budget', skipped: true }],
+              phase: phase || 'main',
+            });
+          }
           msg.ack();
           continue;
         }
 
         console.log(`[QUEUE] 本批 ${actions.length} 个 action，估算消耗 ${consumed}/${maxBudget}，剩余 ${nextRemaining.length} 个`);
-        const batchResults = await executeBatch(actions, cfg, token, console);
+        const { results: batchResults, unexecuted } = await executeBatch(actions, cfg, token, console);
         budget = null;
 
+        // 未执行的 action（因 budget 耗尽）追加到 nextRemaining 前部，下批优先执行
+        const finalRemaining = [...unexecuted, ...nextRemaining];
         const allResults = [...(results || []), ...batchResults];
-        const done = nextRemaining.length === 0;
+        const done = finalRemaining.length === 0;
 
         if (done) {
           const ok = allResults.filter((r) => r.ok).length;
@@ -809,11 +830,11 @@ export default {
         } else {
           // 发下条消息，带更新后的 remaining + results
           await env.E5RNL_QUEUE.send({
-            remaining: nextRemaining,
+            remaining: finalRemaining,
             results: allResults,
             phase: phase || 'main',
           });
-          console.log(`[QUEUE] 已发下批消息，剩余 ${nextRemaining.length} 个 action`);
+          console.log(`[QUEUE] 已发下批消息，剩余 ${finalRemaining.length} 个 action（含 ${unexecuted.length} 个未执行）`);
         }
 
         msg.ack();
@@ -832,13 +853,16 @@ export default {
     // 开启后每个 cron tick 发一条 Queue 消息，consumer 贪心装批执行，剩余自动续批
     if (env.SELF_TEST === '1') {
       try {
-        const allNames = shuffle([...WRITABLE, ...READONLY]).map((a) => a.name);
+        // main 阶段打乱顺序，sweep 阶段固定在后（清扫须在可写动作之后）
+        const mainNames = shuffle([...WRITABLE, ...READONLY]).map((a) => a.name);
+        const sweepNames = SWEEPS.map((a) => a.name);
+        const allNames = [...mainNames, ...sweepNames];
         await env.E5RNL_QUEUE.send({
           remaining: allNames,
           results: [],
           phase: 'main',
         });
-        console.log(`[SELFTEST] 已发首批消息，共 ${allNames.length} 个 action，Queue 自动分批消费`);
+        console.log(`[SELFTEST] 已发首批消息，共 ${allNames.length} 个 action（main ${mainNames.length} + sweep ${sweepNames.length}），Queue 自动分批消费`);
       } catch (e) {
         console.error(`[CRITICAL] 全量自测启动失败：${e.message}`);
       }
