@@ -1,6 +1,7 @@
 name = "e5rnl"
 main = "worker.js"
 compatibility_date = "2024-09-23"
+keep_vars = true
 
 # 固定周期触发。每轮是否真正执行，由 RUN_PROBABILITY 决定。
 [triggers]
@@ -21,7 +22,7 @@ max_batch_timeout = 0
 # ── 调度控制 ──
 RUN_PROBABILITY = "0.5"
 SELF_TEST = "1"
-WORKER_URL = "https://your-worker.your-sub.workers.dev"
+WORKER_URL = "`https://your-worker.your-sub.workers.dev`"
 
 # ── timing ──
 ACTION_DELAY_MIN_MS = "0"
